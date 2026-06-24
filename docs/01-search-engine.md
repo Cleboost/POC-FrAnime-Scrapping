@@ -1,20 +1,44 @@
 # Chapter 1: Search Engine Analysis
 
-Anime-Sama uses a simple but effective internal search engine to find series.
+FRAnime does not expose a dedicated search endpoint. Instead, the entire catalogue is loaded once and filtered client-side in the browser.
 
 ## Endpoint
-- **URL**: `https://anime-sama.to/template-php/defaut/fetch.php`
-- **Method**: `POST`
-- **Payload**: `query=YOUR_SEARCH_TERM`
+- **URL**: `https://api.franime.fr/api/animes`
+- **Method**: `GET`
+- **Required headers**: `Origin: https://franime.fr`, `Referer: https://franime.fr/`
 
 ## Mechanism
-The endpoint returns a raw HTML string containing `<a>` tags with the class `asn-search-result`. Each result contains:
-- The URL of the anime.
-- A cover image (hosted on GitHub raw content).
-- A title and an optional subtitle.
+The endpoint returns a JSON array of every anime in the catalogue. Each object contains:
+- `id`: unique anime identifier (used in all subsequent API calls).
+- `titleO`: original title.
+- `titles`: object with `en`, `en_jp`, `ja_jp` variants.
+- `affiche` / `affiche_small`: cover image URLs.
+- `format`, `status`, `note`: metadata.
+
+### Why client-side?
+The Next.js site fetches this list on mount and stores it in React state. The search input filters the in-memory array locally — no additional network request is made per keystroke. This means **one API call gives us the full catalogue**.
 
 ## POC Implementation
 The script `poc/search.js` implements this by:
-1. Sending the POST request with the query.
-2. Parsing the HTML response using a global Regex.
-3. Decoding HTML entities like `&#039;` to ensure clean JSON output.
+1. Fetching the full catalogue from `/api/animes`.
+2. Lowercasing the query and filtering on all title variants (`titleO`, `titles.en`, `titles.en_jp`, `titles.ja_jp`).
+3. Returning a clean JSON array with only the fields needed for the next step.
+
+### Example output for query `"rezero"`:
+```json
+[
+  {
+    "id": "517396000974",
+    "title": "Re:ZERO -Starting Life in Another World-",
+    "titleO": "Re:ゼロから始める異世界生活",
+    "format": "TV",
+    "status": "Terminé",
+    "note": 4.8
+  }
+]
+```
+
+### Usage:
+```sh
+node poc/search.js "rezero"
+```

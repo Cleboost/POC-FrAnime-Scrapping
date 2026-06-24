@@ -1,25 +1,43 @@
 # Introduction
 
-This project is a Proof of Concept (POC) focused on analyzing and scraping anime content from **Anime-Sama**.
+This project is a Proof of Concept (POC) focused on analyzing and scraping anime content from **FRAnime**.
 
-## What is Anime-Sama?
+## What is FRAnime?
 
-**Anime-Sama** is a popular French community platform dedicated to anime cataloging and streaming. It provides access to a vast library of:
+**FRAnime** is a popular French platform dedicated to anime streaming, available at `franime.fr`. It provides access to a large library of:
 - **Anime**: Available in VOSTFR (Original Voice with French Subtitles) and VF (French Dub).
-- **Manga Scans**: Direct reading of various manga series.
+- **Various formats**: TV series, films, OVAs, ONAs.
 
-One key architectural detail of Anime-Sama is that **it does not host video files directly**. Instead, it acts as an indexer and aggregator, embedding players from third-party services.
+FRAnime does not host video files directly. It acts as an indexer, embedding players from third-party providers inside iframes.
 
 ## What is a Video Provider?
 
-A **Video Provider** (or Video Hoster) is an external service used by platforms like Anime-Sama to store and stream actual video files. When you watch an episode, you are interacting with an `<iframe>` that loads a player from one of these providers.
+A **Video Provider** is an external service used by FRAnime to store and stream actual video files. When you watch an episode, the site loads a player from one of these providers.
 
-Common providers found on the site include:
-- **Vidmoly**: A cloud-based video hosting platform.
-- **Sendvid**: A simple video sharing service.
-- **Sibnet**: A Russian multimedia host.
+Providers found on FRAnime include:
+- **Vidmoly** (`vidmoly.biz`): Cloud-based video host, streams via HLS (`.m3u8`).
+- **Sibnet** (`video.sibnet.ru`): Russian multimedia host, streams via `.mp4`.
+- **Sendvid** (`sendvid.com`): Simple video sharing service.
+- **Filemoon**: Cloud video host.
 
-### The Scraping Challenge
-Scraping Anime-Sama involves two distinct steps:
-1. **Catalog Scraping**: Navigating the site's structure to find anime URLs, seasons, languages, and episode lists.
-2. **Video Extraction**: Identifying the provider's iframe URL and then "breaking out" of that iframe to find the direct stream link (usually an `.m3u8` or `.mp4` file) if possible.
+## Architecture Overview
+
+FRAnime is built with **Next.js App Router** and communicates with a dedicated REST API at `api.franime.fr`.
+
+### Key discovery: client-side search
+Unlike most sites, FRAnime does **not** have a server-side search endpoint. Instead, it fetches the **entire catalogue** on first load and filters locally in the browser. This means one API call gives us all anime data.
+
+### Cloudflare protection
+The site is protected by **Cloudflare**. Most API endpoints are accessible with the correct `Origin` and `Referer` headers, but the `/watch2/` proxy page (which decodes the obfuscated provider URL) requires a real browser session. We bypass this by injecting an iframe into the already-loaded homepage.
+
+## The Scraping Pipeline
+
+The POC is split into 5 independent steps, each building on the output of the previous one:
+
+| Step | Script | Input | Output |
+|------|--------|-------|--------|
+| 1 | `search.js` | search query | list of animes with IDs |
+| 2 | `details.js` | anime ID | seasons, episodes, available lecteurs |
+| 3 | `stream.js` | anime ID + indices + lang | `/watch2/` URL |
+| 4 | `watch2.js` | `/watch2/` URL | provider embed URL |
+| 5 | `extract.js` | provider embed URL | direct stream URL (`.m3u8` / `.mp4`) |

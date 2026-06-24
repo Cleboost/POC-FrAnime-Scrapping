@@ -1,173 +1,241 @@
 /**
- * Integrated Demo: Anime-Sama to M3U8
- * Usage: node demo/index.js "Anime Name" [season_number] [episode_number]
+ * Integrated Demo: FRAnime to direct stream URL
+ * Usage: node demo/index.js "Anime Name" [saison] [episode] [lang] [lecteur]
+ *
+ * saison, episode : 1-based (default: 1)
+ * lang            : vo | vf (default: vo)
+ * lecteur         : 1-based (default: 1)
  */
 
-// --- Import/Implement POC Logic ---
+const { chromium } = require("playwright");
+const path = require("path");
+const os = require("os");
+const fs = require("fs");
+
+const API_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Origin": "https://franime.fr",
+  "Referer": "https://franime.fr/",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-site",
+};
+
+const PROVIDER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://franime.fr/",
+};
+
+// --- Step 1: Search ---
 
 async function searchAnime(query) {
-    const response = await fetch("https://anime-sama.to/template-php/defaut/fetch.php", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `query=${encodeURIComponent(query)}`
-    });
-    const html = await response.text();
-    const results = [];
-    const regex = /<a href="([^"]+)" class="asn-search-result">[\s\S]*?src="([^"]+)"[\s\S]*?title">([^<]+)<\/h3>[\s\S]*?subtitle">([^<]*)<\/p>/g;
-    let m;
-    while ((m = regex.exec(html)) !== null) {
-        results.push({
-            url: m[1],
-            title: m[3].replace(/&#039;/g, "'").replace(/&quot;/g, '"').trim()
-        });
+  const res = await fetch("https://api.franime.fr/api/animes", { headers: API_HEADERS });
+  const animes = await res.json();
+  const q = query.toLowerCase();
+  return animes.filter((a) => {
+    const titles = [a.titleO, a.titles?.en, a.titles?.en_jp, a.titles?.ja_jp];
+    return titles.some((t) => t?.toLowerCase().includes(q));
+  });
+}
+
+// --- Step 2: Details ---
+
+async function getAnimeDetails(animeId) {
+  const res = await fetch(`https://api.franime.fr/api/anime-by-id/${animeId}`, { headers: API_HEADERS });
+  return res.json();
+}
+
+// --- Step 3: Stream (GET_LECTEUR) ---
+
+async function getWatch2Url(animeId, saisonIndex, episodeIndex, lang, lecteurIndex) {
+  const url = `https://api.franime.fr/api/anime/${animeId}/${saisonIndex}/${episodeIndex}/${lang}/${lecteurIndex}`;
+  const res = await fetch(url, { headers: API_HEADERS });
+  if (!res.ok) throw new Error(`GET_LECTEUR HTTP ${res.status}`);
+  return res.text();
+}
+
+// --- Step 4: Watch2 (Playwright iframe bypass) ---
+
+const PROVIDERS = ["sibnet.ru", "filemoon", "sendvid", "vidmoly", "streamtape", "doodstream"];
+
+async function resolveWatch2(watch2Url) {
+  const userDataDir = path.join(os.tmpdir(), "pw-franime-profile");
+  fs.mkdirSync(userDataDir, { recursive: true });
+
+  const context = await chromium.launchPersistentContext(userDataDir, {
+    headless: false,
+    executablePath: "/usr/bin/google-chrome-stable",
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--window-size=1920,1080"],
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    viewport: { width: 1920, height: 1080 },
+    extraHTTPHeaders: { "Accept-Language": "fr-FR,fr;q=0.9" },
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    window.chrome = { runtime: {} };
+  });
+
+  const page = await context.newPage();
+  let providerUrl = null;
+
+  const capture = (url) => {
+    if (!providerUrl && PROVIDERS.some((p) => url.includes(p))) providerUrl = url;
+  };
+
+  page.on("request", (req) => capture(req.url()));
+  page.on("framenavigated", (f) => capture(f.url()));
+
+  try {
+    await page.goto("https://franime.fr/", { waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForTimeout(2000);
+
+    await page.evaluate((url) => {
+      const iframe = document.createElement("iframe");
+      iframe.src = url;
+      iframe.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;border:none;";
+      document.body.appendChild(iframe);
+    }, watch2Url);
+
+    const deadline = Date.now() + 15000;
+    while (!providerUrl && Date.now() < deadline) {
+      await page.waitForTimeout(300);
     }
-    return results;
+
+    await context.close();
+    return providerUrl;
+  } catch (err) {
+    await context.close();
+    throw err;
+  }
 }
 
-async function extractAnimeDetails(url) {
-    const response = await fetch(url);
-    const html = await response.text();
-    const anime = [];
-    const animeRegex = /panneauAnime\("([^"]+)",\s*"([^"]+)"\)/g;
-    let m = animeRegex.exec(html);
-    while (m !== null) {
-        if (m[1] !== "nom" && m[2] !== "url") {
-            anime.push({ name: m[1], url: m[2] });
-        }
-        m = animeRegex.exec(html);
+async function extractFilemoon(url) {
+  const { chromium } = require("playwright");
+
+  const browser = await chromium.launch({
+    headless: false,
+    executablePath: "/usr/bin/google-chrome-stable",
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+  const page = await browser.newPage();
+  let streamUrl = null;
+
+  const capture = (u) => { if (!streamUrl && u.includes("master.m3u8")) streamUrl = u; };
+  page.on("request", (req) => capture(req.url()));
+
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+
+    await page.waitForTimeout(4000);
+    await page.mouse.click(640, 360);
+
+    const deadline = Date.now() + 25000;
+    while (!streamUrl && Date.now() < deadline) {
+      await page.waitForTimeout(500);
     }
-    return anime;
+    await browser.close();
+    return streamUrl;
+  } catch (err) {
+    await browser.close();
+    throw err;
+  }
 }
 
-async function getAvailableLanguages(url) {
-    const baseUrl = url.endsWith('/') ? url.slice(0, -1) : url;
-    const parentUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/')) + '/';
-    const POSSIBLE_LANGS = ['vostfr', 'vf', 'vf1', 'vf2'];
-    const probes = POSSIBLE_LANGS.map(async (lang) => {
-        const testUrl = `${parentUrl}${lang}/`;
-        try {
-            const response = await fetch(testUrl, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
-            if (response.ok) return { lang: lang.toUpperCase(), url: testUrl };
-        } catch (e) {}
-        return null;
+// --- Step 5: Extract stream ---
+
+async function extractStream(providerUrl) {
+  if (providerUrl.includes("vidmoly")) {
+    const res = await fetch(providerUrl, { headers: PROVIDER_HEADERS });
+    const html = await res.text();
+    const m = html.match(/file:\s*["']([^"']+\.m3u8[^"']*)['"]/);
+    return m ? m[1] : null;
+  }
+
+  if (providerUrl.includes("sibnet")) {
+    const res = await fetch(providerUrl, { headers: PROVIDER_HEADERS });
+    const html = await res.text();
+    const m = html.match(/src:\s*["'](\/v\/[a-f0-9]+\/\d+\.mp4)['"]/);
+    if (!m) return null;
+    const redirect = await fetch(`https://video.sibnet.ru${m[1]}`, {
+      headers: { ...PROVIDER_HEADERS, "Referer": providerUrl },
+      redirect: "manual",
     });
-    const results = await Promise.all(probes);
-    return results.filter(res => res !== null);
+    const location = redirect.headers.get("location");
+    return location ? (location.startsWith("//") ? `https:${location}` : location) : null;
+  }
+
+  if (providerUrl.includes("sendvid")) {
+    const res = await fetch(providerUrl, { headers: PROVIDER_HEADERS });
+    const html = await res.text();
+    const m = html.match(/source\s+src="([^"]+\.(?:m3u8|mp4)[^"]*)"|file:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)['"]/);
+    return m ? (m[1] || m[2]) : null;
+  }
+
+  if (providerUrl.includes("filemoon")) {
+    return extractFilemoon(providerUrl);
+  }
+
+  throw new Error(`Unsupported provider: ${providerUrl}`);
 }
 
-async function getEpisodes(baseUrl) {
-    const url = baseUrl.endsWith('episodes.js') ? baseUrl : (baseUrl.endsWith('/') ? baseUrl + 'episodes.js' : baseUrl + '/episodes.js');
-    const response = await fetch(url);
-    const code = await response.text();
-    const providers = [];
-    const arrayRegex = /var\s+eps(\d+)\s*=\s*\[([\s\S]*?)\];/g;
-    let m = arrayRegex.exec(code);
-    while (m !== null) {
-        const id = m[1];
-        const content = m[2];
-        const links = content.split(',').map(link => link.trim().replace(/'/g, "")).filter(link => link.startsWith('http'));
-        if (links.length > 0) {
-            let hostname = new URL(links[0]).hostname.replace('www.', '');
-            const processedLinks = hostname === 'vidmoly.to' ? links.map(link => link.replace('vidmoly.to', 'vidmoly.biz')) : links;
-            if (hostname === 'vidmoly.to') hostname = 'vidmoly.biz';
-            providers.push({ id: parseInt(id), provider: hostname, episodes: processedLinks });
-        }
-        m = arrayRegex.exec(code);
-    }
-    return providers;
-}
-
-async function extractVidmolyStream(url) {
-    const response = await fetch(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://anime-sama.to/'
-        }
-    });
-    const html = await response.text();
-    const streamMatch = html.match(/file:\s*'([^']+\.m3u8[^']*)'/);
-    return streamMatch ? streamMatch[1] : null;
-}
-
-// --- Main CLI Logic ---
+// --- Main ---
 
 async function main() {
-    const args = process.argv.slice(2);
-    if (args.length < 1) {
-        console.log('Usage: node demo/index.js "Anime Name" [season_number] [episode_number]');
-        process.exit(1);
-    }
+  const args = process.argv.slice(2);
+  if (args.length < 1) {
+    console.log('Usage: node demo/index.js "Anime Name" [saison] [episode] [lang] [lecteur]');
+    process.exit(1);
+  }
 
-    const animeName = args[0];
-    const targetSeason = parseInt(args[1]) || 1;
-    const targetEpisode = parseInt(args[2]) || 1;
+  const animeName = args[0];
+  const targetSaison = parseInt(args[1] ?? "1") - 1;   // 0-based
+  const targetEpisode = parseInt(args[2] ?? "1") - 1;  // 0-based
+  const lang = args[3] ?? "vo";
+  const lecteurIndex = parseInt(args[4] ?? "1") - 1;   // 0-based
 
-    console.log(`[1/5] Searching for: "${animeName}"...`);
-    const searchResults = await searchAnime(animeName);
-    if (searchResults.length === 0) {
-        console.error('No anime found.');
-        return;
-    }
-    const animeUrl = searchResults[0].url;
-    console.log(`Found: ${searchResults[0].title} (${animeUrl})`);
+  // 1. Search
+  console.log(`[1/5] Searching: "${animeName}"...`);
+  const results = await searchAnime(animeName);
+  if (!results.length) { console.error("No anime found."); process.exit(1); }
+  const anime = results[0];
+  console.log(`      → ${anime.titles?.en || anime.titleO} (id: ${anime.id})`);
 
-    console.log(`[2/5] Extracting seasons...`);
-    const seasons = await extractAnimeDetails(animeUrl);
-    // Find matching season (simple heuristic: look for "Saison X" or "Saison 0X")
-    const season = seasons.find(s => s.name.toLowerCase().includes(`saison ${targetSeason}`) || s.name.toLowerCase().includes(`saison 0${targetSeason}`));
-    if (!season) {
-        console.error(`Season ${targetSeason} not found among:`, seasons.map(s => s.name).join(', '));
-        return;
-    }
-    console.log(`Selected: ${season.name}`);
+  // 2. Details
+  console.log(`[2/5] Fetching details...`);
+  const details = await getAnimeDetails(anime.id);
+  const saison = details.saisons?.[targetSaison];
+  if (!saison) { console.error(`Saison ${targetSaison + 1} not found.`); process.exit(1); }
+  const episode = saison.episodes?.[targetEpisode];
+  if (!episode) { console.error(`Episode ${targetEpisode + 1} not found.`); process.exit(1); }
+  const lecteurs = episode.lang?.[lang]?.lecteurs ?? [];
+  if (!lecteurs.length) { console.error(`No lecteur for lang=${lang}`); process.exit(1); }
+  console.log(`      → ${saison.title} / ${episode.title} / ${lang} / lecteur[${lecteurIndex}]: ${lecteurs[lecteurIndex]}`);
 
-    // Build the season base URL (need to resolve relative URLs if necessary)
-    // Most panneauAnime URLs are relative to the anime page
-    const seasonUrl = season.url.startsWith('http') ? season.url : (animeUrl.endsWith('/') ? animeUrl + season.url : animeUrl + '/' + season.url);
+  // 3. GET_LECTEUR → watch2 URL
+  console.log(`[3/5] Resolving lecteur...`);
+  const watch2Url = await getWatch2Url(anime.id, targetSaison, targetEpisode, lang, lecteurIndex);
+  console.log(`      → ${watch2Url}`);
 
-    console.log(`[3/5] Checking available languages for season...`);
-    // Note: extract.js panneauAnime often points directly to a lang (e.g. "saison1/vostfr")
-    // If it already includes a lang, we use it, otherwise we probe.
-    let langUrl = seasonUrl;
-    if (!langUrl.includes('vostfr') && !langUrl.includes('vf')) {
-        const langs = await getAvailableLanguages(seasonUrl);
-        if (langs.length === 0) {
-            console.error('No languages found for this season.');
-            return;
-        }
-        // Prefer VOSTFR, then VF
-        const preferred = langs.find(l => l.lang === 'VOSTFR') || langs.find(l => l.lang === 'VF') || langs[0];
-        langUrl = preferred.url;
-    }
-    console.log(`Using language URL: ${langUrl}`);
+  // 4. Bypass CF → provider URL
+  console.log(`[4/5] Bypassing Cloudflare (browser)...`);
+  const providerUrl = await resolveWatch2(watch2Url);
+  if (!providerUrl) { console.error("Could not resolve provider URL."); process.exit(1); }
+  console.log(`      → ${providerUrl}`);
 
-    console.log(`[4/5] Fetching episode list...`);
-    const providers = await getEpisodes(langUrl);
-    const vidmoly = providers.find(p => p.provider === 'vidmoly.biz');
-    if (!vidmoly) {
-        console.error('Vidmoly provider not found.');
-        return;
-    }
+  // 5. Extract stream
+  console.log(`[5/5] Extracting stream...`);
+  const streamUrl = await extractStream(providerUrl);
+  if (!streamUrl) { console.error("Could not extract stream URL."); process.exit(1); }
 
-    if (targetEpisode > vidmoly.episodes.length || targetEpisode < 1) {
-        console.error(`Episode ${targetEpisode} not found (Max: ${vidmoly.episodes.length})`);
-        return;
-    }
-    const episodeUrl = vidmoly.episodes[targetEpisode - 1];
-    console.log(`Selected Episode ${targetEpisode}: ${episodeUrl}`);
-
-    console.log(`[5/5] Extracting M3U8 stream...`);
-    const streamUrl = await extractVidmolyStream(episodeUrl);
-    if (!streamUrl) {
-        console.error('Could not extract stream URL.');
-        return;
-    }
-
-    console.log('\n--- SUCCESS ---');
-    console.log(`Anime: ${searchResults[0].title}`);
-    console.log(`Season: ${targetSeason}`);
-    console.log(`Episode: ${targetEpisode}`);
-    console.log(`Stream URL: ${streamUrl}`);
+  console.log(`\n--- SUCCESS ---`);
+  console.log(`Anime   : ${anime.titles?.en || anime.titleO}`);
+  console.log(`Saison  : ${targetSaison + 1} — ${saison.title}`);
+  console.log(`Episode : ${targetEpisode + 1} — ${episode.title}`);
+  console.log(`Lang    : ${lang.toUpperCase()}`);
+  console.log(`Provider: ${providerUrl}`);
+  console.log(`Stream  : ${streamUrl}`);
 }
 
-main().catch(err => console.error('An error occurred:', err));
+main().catch((err) => { console.error("Error:", err.message); process.exit(1); });

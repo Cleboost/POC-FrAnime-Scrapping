@@ -1,48 +1,114 @@
 /**
- * POC: Extract Seasons & Scans from Anime-Sama
- * Simple implementation parsing script calls in HTML
+ * POC: Extract direct stream URL (.m3u8 / .mp4) from a provider embed URL
+ * Input:  provider embed URL (vidmoly, sibnet, sendvid, filemoon...)
+ * Output: direct stream URL
+ *
+ * Vidmoly:  regex on HTML → .m3u8
+ * Sibnet:   regex on HTML → /v/<token>/<id>.mp4 → follow redirect → CDN mp4
+ * Sendvid:  regex on HTML → .mp4 or .m3u8
+ * Filemoon: Playwright → intercept master.m3u8 request (PoW-protected API)
  */
 
-async function extractAnimeDetails(url) {
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Referer": "https://franime.fr/",
+};
+
+// --- Vidmoly ---
+
+async function extractVidmoly(url) {
+  const res = await fetch(url, { headers: HEADERS });
+  const html = await res.text();
+  const m = html.match(/file:\s*["']([^"']+\.m3u8[^"']*)['"]/);
+  return m ? m[1] : null;
+}
+
+// --- Sibnet ---
+// The embed HTML contains /v/<token>/<videoid>.mp4 which redirects to the CDN mp4.
+
+async function extractSibnet(url) {
+  const res = await fetch(url, {
+    headers: { ...HEADERS, "Referer": "https://franime.fr/" },
+  });
+  const html = await res.text();
+
+  const m = html.match(/src:\s*["'](\/v\/[a-f0-9]+\/\d+\.mp4)['"]/);
+  if (!m) return null;
+
+  const embedPath = m[1];
+  const redirect = await fetch(`https://video.sibnet.ru${embedPath}`, {
+    headers: {
+      ...HEADERS,
+      "Referer": url,
+    },
+    redirect: "manual",
+  });
+
+  // Sibnet redirects to the real CDN URL
+  const location = redirect.headers.get("location");
+  if (!location) return null;
+  return location.startsWith("//") ? `https:${location}` : location;
+}
+
+// --- Sendvid ---
+
+async function extractSendvid(url) {
+  const res = await fetch(url, { headers: HEADERS });
+  const html = await res.text();
+  const m = html.match(/source\s+src="([^"]+\.(?:m3u8|mp4)[^"]*)"|file:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)['"]/);
+  return m ? (m[1] || m[2]) : null;
+}
+
+// --- Filemoon ---
+// Protected by a PoW + captcha challenge at runtime — Playwright is required.
+// Strategy: load filemoon.to/e/<code> and let the SPA navigate naturally to the
+// q8y5z.com player. Intercept the master.m3u8 request from any frame or page.
+
+async function extractFilemoon(url) {
+  const { chromium } = require("playwright");
+
+  const browser = await chromium.launch({
+    headless: false,
+    executablePath: "/usr/bin/google-chrome-stable",
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+  // Use default viewport (1280x720) — custom viewport breaks the play button click detection
+  const page = await browser.newPage();
+  let streamUrl = null;
+
+  const capture = (u) => { if (!streamUrl && u.includes("master.m3u8")) streamUrl = u; };
+  page.on("request", (req) => capture(req.url()));
+
   try {
-    const response = await fetch(url);
-    const html = await response.text();
+    // Let the SPA fetch embed/details and navigate to q8y5z.com on its own
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
 
-    const data = {
-      anime: [],
-      manga: [],
-    };
+    // Wait for the player to initialize, then click the play button (center of default viewport)
+    await page.waitForTimeout(4000);
+    await page.mouse.click(640, 360);
 
-    // Anime extraction (Seasons, Movies...)
-    const animeRegex = /panneauAnime\("([^"]+)",\s*"([^"]+)"\)/g;
-    let mAnime = animeRegex.exec(html);
-    while (mAnime !== null) {
-      if (mAnime[1] !== "nom" && mAnime[2] !== "url") {
-        data.anime.push({ name: mAnime[1], url: mAnime[2] });
-      }
-      mAnime = animeRegex.exec(html);
+    const deadline = Date.now() + 25000;
+    while (!streamUrl && Date.now() < deadline) {
+      await page.waitForTimeout(500);
     }
-
-    // Manga extraction (Scans, Modulo...)
-    const scanRegex = /panneauScan\("([^"]+)",\s*"([^"]+)"\)/g;
-    let mScan = scanRegex.exec(html);
-    while (mScan !== null) {
-      if (mScan[1] !== "nom" && mScan[2] !== "url") {
-        data.manga.push({ name: mScan[1], url: mScan[2] });
-      }
-      mScan = scanRegex.exec(html);
-    }
-
-    return data;
-  } catch (error) {
-    console.error("Extraction error:", error);
-    return null;
+    await browser.close();
+    return streamUrl;
+  } catch (err) {
+    await browser.close();
+    throw err;
   }
 }
 
+// --- Router ---
+
+async function extractStream(providerUrl) {
+  if (providerUrl.includes("vidmoly")) return extractVidmoly(providerUrl);
+  if (providerUrl.includes("sibnet")) return extractSibnet(providerUrl);
+  if (providerUrl.includes("sendvid")) return extractSendvid(providerUrl);
+  if (providerUrl.includes("filemoon")) return extractFilemoon(providerUrl);
+  throw new Error(`Unsupported provider: ${providerUrl}`);
+}
+
 // Direct test
-const url =
-  process.argv[2] || "https://anime-sama.to/catalogue/jujutsu-kaisen/";
-extractAnimeDetails(url).then((data) => {
-  if (data) console.log(JSON.stringify(data, null, 2));
-});
+const providerUrl = process.argv[2] || "https://video.sibnet.ru/shell.php?videoid=4956170";
+extractStream(providerUrl).then((url) => console.log(url));
