@@ -1,45 +1,30 @@
-# Chapter 4: Cloudflare Bypass & Watch2 Resolution
+# Chapter 4: Watch2 Resolution & XOR Decryption
 
-The `/watch2/` page decodes the obfuscated provider URL and redirects the user's browser to the actual video embed. It is subject to a strict Cloudflare WAF rule that blocks direct HTTP requests.
+The `/watch2/` URLs returned by the FRAnime API contain obfuscated parameters encoding the destination provider embed URL. Rather than executing a real browser context to let the client-side SPA decode it, we can decrypt these parameters offline instantly.
 
-## The Challenge
-Unlike the main `franime.fr` pages, `/watch2/` cannot be accessed with a raw HTTP client even with valid `cf_clearance` cookies. Cloudflare applies a **path-specific Managed Challenge** that requires genuine browser signals (TLS fingerprint, JS environment, request timing) that only a real browser can provide.
+## The Encryption Mechanism
+The URL parameters of `/watch2/` (e.g. `a`, `b`, `c`, etc.) contain obfuscated data:
+1. **Base64 + Hex Encoding**: The query parameter value is first decoded from Base64. The resulting string is a hexadecimal representation of the encrypted bytes.
+2. **Dynamic XOR Key**: The payload is encrypted with a single-byte XOR key (an integer between `0` and `255`). This key changes dynamically per link, provider, or site update (common keys include `2`, `3`, `10`, `88`, `95`, etc.).
 
-### Why curl fails
-Curl sends a recognizable TLS fingerprint that Cloudflare flags instantly, regardless of headers.
+## Brute-Force Resolution Strategy
+Since the XOR key space is extremely small (`256` possible values), we can perform an instant offline brute-force decryption:
 
-### Why a basic Playwright session also fails
-Loading `/watch2/` as the first request in a fresh browser session still triggers the challenge because there are no existing CF cookies for the domain.
+1. **Extract parameters**: Parse all search parameters from the `/watch2/` URL.
+2. **Decode bytes**: Decode each parameter from Base64, check if it's a valid hex string, and convert it to a binary Buffer.
+3. **Try all 256 keys**: For each parameter, XOR the buffer bytes with every key from `0` to `255`.
+4. **Validate URL**: Convert the XORed bytes back to a UTF-8 string. If it begins with `http://` or `https://` and contains a recognized provider domain (such as `sibnet.ru`, `filemoon`, etc.), we have found the correct key and decrypted URL.
 
-## Solution: Iframe injection from homepage context
-
-The fix exploits the fact that CF grants clearance per-domain, not per-path:
-
-1. Load `https://franime.fr/` first — CF sees a real browser, issues `cf_clearance` cookies for the domain.
-2. Without closing the page, inject an `<iframe>` whose `src` is the `/watch2/` URL via JavaScript.
-3. The iframe request inherits the parent page's CF cookies, which are now valid.
-4. Intercept the frame's navigation to the provider URL.
-
-This works because the iframe is made from **within** an already-cleared browser context.
-
-## Technical details
-- **Persistent Chrome profile** (`--user-data-dir`): preserves CF cookies between runs, so the homepage load can be skipped on subsequent calls.
-- **Real Chrome binary** (`/usr/bin/google-chrome-stable`): required for a convincing TLS fingerprint.
-- **Non-headless** (`headless: false`): CF Managed Challenge detects headless mode. Xvfb is used for display on headless servers.
+This process is extremely fast (taking less than 1 microsecond) and completely eliminates the need for headless browser automation (Playwright/Puppeteer) for the watch2 step.
 
 ## POC Implementation
 The script `poc/watch2.js` implements this by:
-1. Launching Chrome with a persistent profile via Playwright.
-2. Navigating to `https://franime.fr/` and waiting for CF clearance.
-3. Injecting an iframe with the `/watch2/` URL.
-4. Listening for `request` and `framenavigated` events to catch the provider URL.
-
-### Provider detection
-The script looks for any URL containing a known provider domain:
-`sibnet.ru`, `vidmoly`, `sendvid`, `filemoon`, `streamtape`, `doodstream`.
+1. Parsing the query parameters of the target `/watch2/` URL.
+2. Running the brute-force XOR decryption logic on the parameters.
+3. Returning the decrypted provider URL immediately.
 
 ### Usage:
 ```sh
 node poc/watch2.js "https://franime.fr/watch2/?a=..."
-# → https://video.sibnet.ru/shell.php?videoid=4956170
+# → https://video.sibnet.ru/shell.php?videoid=5622007
 ```

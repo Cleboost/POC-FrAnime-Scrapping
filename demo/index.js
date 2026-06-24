@@ -7,10 +7,7 @@
  * lecteur         : 1-based (default: 1)
  */
 
-const { chromium } = require("playwright");
-const path = require("path");
-const os = require("os");
-const fs = require("fs");
+
 
 const API_HEADERS = {
   "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -59,56 +56,41 @@ async function getWatch2Url(animeId, saisonIndex, episodeIndex, lang, lecteurInd
 
 const PROVIDERS = ["sibnet.ru", "filemoon", "sendvid", "vidmoly", "streamtape", "doodstream"];
 
-async function resolveWatch2(watch2Url) {
-  const userDataDir = path.join(os.tmpdir(), "pw-franime-profile");
-  fs.mkdirSync(userDataDir, { recursive: true });
-
-  const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: false,
-    executablePath: "/usr/bin/google-chrome-stable",
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--window-size=1920,1080"],
-    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    viewport: { width: 1920, height: 1080 },
-    extraHTTPHeaders: { "Accept-Language": "fr-FR,fr;q=0.9" },
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    window.chrome = { runtime: {} };
-  });
-
-  const page = await context.newPage();
-  let providerUrl = null;
-
-  const capture = (url) => {
-    if (!providerUrl && PROVIDERS.some((p) => url.includes(p))) providerUrl = url;
-  };
-
-  page.on("request", (req) => capture(req.url()));
-  page.on("framenavigated", (f) => capture(f.url()));
-
+function decryptWatch2(watch2Url) {
   try {
-    await page.goto("https://franime.fr/", { waitUntil: "domcontentloaded", timeout: 20000 });
-    await page.waitForTimeout(2000);
+    const url = new URL(watch2Url);
+    for (const [paramName, value] of url.searchParams.entries()) {
+      try {
+        const base64Decoded = Buffer.from(value, "base64").toString("utf-8");
+        if (!/^[0-9a-fA-F]+$/.test(base64Decoded) || base64Decoded.length % 2 !== 0) {
+          continue;
+        }
+        const hexBuffer = Buffer.from(base64Decoded, "hex");
 
-    await page.evaluate((url) => {
-      const iframe = document.createElement("iframe");
-      iframe.src = url;
-      iframe.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;border:none;";
-      document.body.appendChild(iframe);
-    }, watch2Url);
-
-    const deadline = Date.now() + 15000;
-    while (!providerUrl && Date.now() < deadline) {
-      await page.waitForTimeout(300);
+        for (let key = 0; key < 256; key++) {
+          const decodedBytes = Buffer.alloc(hexBuffer.length);
+          for (let i = 0; i < hexBuffer.length; i++) {
+            decodedBytes[i] = hexBuffer[i] ^ key;
+          }
+          const decodedStr = decodedBytes.toString("utf-8");
+          if (decodedStr.startsWith("http://") || decodedStr.startsWith("https://")) {
+            if (PROVIDERS.some((p) => decodedStr.includes(p))) {
+              return decodedStr;
+            }
+          }
+        }
+      } catch (e) {
+        // Continue to check other parameters
+      }
     }
-
-    await context.close();
-    return providerUrl;
-  } catch (err) {
-    await context.close();
-    throw err;
+  } catch (e) {
+    // Invalid URL format
   }
+  return null;
+}
+
+async function resolveWatch2(watch2Url) {
+  return decryptWatch2(watch2Url);
 }
 
 async function extractFilemoon(url) {

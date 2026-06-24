@@ -27,8 +27,8 @@ FRAnime is built with **Next.js App Router** and communicates with a dedicated R
 ### Key discovery: client-side search
 Unlike most sites, FRAnime does **not** have a server-side search endpoint. Instead, it fetches the **entire catalogue** on first load and filters locally in the browser. This means one API call gives us all anime data.
 
-### Cloudflare protection
-The site is protected by **Cloudflare**. Most API endpoints are accessible with the correct `Origin` and `Referer` headers, but the `/watch2/` proxy page (which decodes the obfuscated provider URL) requires a real browser session. We bypass this by injecting an iframe into the already-loaded homepage.
+### Cloudflare protection & Watch2
+The site is protected by **Cloudflare**. Most API endpoints are accessible with the correct `Origin` and `Referer` headers. Although the web platform decodes the `/watch2/` redirect URLs on the client side inside the browser, we decrypt these obfuscated redirect URLs offline using a fast XOR brute-force technique. This completely bypasses the need for a browser session.
 
 ## The Scraping Pipeline
 
